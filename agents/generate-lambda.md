@@ -1,0 +1,359 @@
+---
+name: generate-lambda
+description: >
+  Use this agent to generate a new AWS Lambda handler with index.ts and schema.ts.
+  Trigger when the user says "generate a lambda", "create a handler", "add an endpoint",
+  "new lambda function", or provides a resource and action like "generate user get".
+
+  <example>
+  Context: User wants to add a new API endpoint to the project.
+  user: "Generate a lambda for user get"
+  assistant: "I'll launch the generate-lambda agent to scaffold the handler."
+  <commentary>
+  Resource and action are provided — agent pre-fills the questions and proceeds.
+  </commentary>
+  </example>
+
+  <example>
+  Context: User wants to create a new POST endpoint.
+  user: "Create a handler for creating orders"
+  assistant: "Launching the generate-lambda agent to generate the order create handler."
+  <commentary>
+  Resource is implied from context — agent asks for confirmation and fills in defaults.
+  </commentary>
+  </example>
+
+model: inherit
+color: magenta
+tools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+---
+
+Generate a new AWS Lambda handler following the project's established patterns.
+
+## Step 1 — Collect handler information
+
+Use AskUserQuestion to confirm the details needed to generate the handler.
+If the user's request already contains a resource and/or action, pre-fill those answers.
+Ask all questions in a single call.
+
+Questions to ask:
+
+1. **Resource name** — the entity this handler operates on (e.g. `user`, `order`, `post`)
+   - Options: free text
+
+2. **HTTP method** — the method this handler handles
+   - Options: GET (single), GET (list), POST, PUT, DELETE
+
+3. **Action name** — the sub-directory name under the resource (e.g. `get`, `list`, `create`, `update`, `delete`)
+   - Suggest based on method if not provided: GET (single) → get, GET (list) → list, POST → create, PUT → update, DELETE → delete
+   - Options: free text
+
+4. **Does this handler use the database?**
+   - Options: Yes, No
+
+5. **Path parameters** — comma-separated list of path param names, or leave blank
+   - e.g. `id` for `/users/{id}`, `userId,postId` for `/users/{userId}/posts/{postId}`
+   - Options: free text (blank = none)
+
+Do not proceed until the user answers.
+
+## Step 2 — Confirm the output path
+
+Before generating files, confirm the output with the user:
+
+```
+I'll create the following files:
+  src/functions/<resource>/<action>/index.ts
+  src/functions/<resource>/<action>/schema.ts
+
+And register the route in:
+  scripts/generate-openapi.ts
+```
+
+Proceed after confirmation.
+
+## Step 3 — Inspect the project for context
+
+Before generating, gather context from the existing codebase:
+
+1. Check if `src/utils/schema.util.ts` exists — determines whether to use `SCHEMA.common.*` for common field types
+2. Check `scripts/generate-openapi.ts` to see the existing import pattern so the new import is consistent
+
+```bash
+ls src/utils/schema.util.ts 2>/dev/null && echo "EXISTS" || echo "MISSING"
+```
+
+3. If DB is needed, check whether `src/db/schema.ts` exists:
+
+```bash
+ls src/db/schema.ts 2>/dev/null && echo "EXISTS" || echo "MISSING"
+```
+
+- **If MISSING**: The DB module has not been initialized. Before generating the handler, create the following files following the templates in `.claude/skills/drizzle-developer/SKILL.md`:
+  - `drizzle.config.ts` — detect dialect from installed packages (`pg` → `postgresql`, `mysql2` → `mysql`)
+  - `src/db/index.ts` — Drizzle singleton (PostgreSQL or MySQL)
+  - `src/db/schema.ts` — add the table for this resource
+  - `src/db/types.ts` — export inferred `Select` / `Insert` types for the new table
+
+- **If EXISTS**: Read `src/db/schema.ts` to find the table for this resource. If the table is missing, add it following the existing dialect and conventions, then update `src/db/types.ts` with the new inferred types.
+
+## Step 4 — Generate src/functions/<resource>/<action>/schema.ts
+
+Before writing any Zod schema, read the Zod v4 reference:
+
+```
+.claude/skills/lambda-api-developer/references/zod.md
+```
+
+Follow its API patterns strictly — in particular:
+- Use `z.uuid()`, `z.email()`, `z.url()`, `z.iso.datetime()` (top-level, not `z.string().xxx()`)
+- Add `.describe('...')` to every field — required for OpenAPI spec generation
+- Use `z.coerce.number()` for query parameters
+
+Choose the correct template based on the HTTP method.
+
+### GET (single) — path param only
+
+```typescript
+import { APIGatewayProxyEventSchema } from '@aws-lambda-powertools/parser/schemas/api-gateway';
+import z from 'zod';
+import { registry } from '@/utils/openapi.util';
+
+const pathParamsSchema = z.object({
+  <param>: z.uuid().describe('<param> of the <resource>'),
+});
+
+const responseSchema = z.object({
+  // TODO: define response fields based on the DB table columns
+  id: z.uuid().describe('Unique identifier'),
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/<resource>/{<param>}',
+  summary: 'Get a <resource> by <param>',
+  tags: ['<Resource>'],
+  request: { params: pathParamsSchema },
+  responses: {
+    200: { description: 'Success', content: { 'application/json': { schema: responseSchema } } },
+    404: { description: '<Resource> not found' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+export const schema = APIGatewayProxyEventSchema.extend({
+  pathParameters: pathParamsSchema,
+});
+```
+
+### GET (list) — query params with pagination
+
+```typescript
+import { APIGatewayProxyEventSchema } from '@aws-lambda-powertools/parser/schemas/api-gateway';
+import z from 'zod';
+import { registry } from '@/utils/openapi.util';
+
+const queryParamsSchema = z.object({
+  offset: z.coerce.number().int().min(0).default(0).describe('Number of records to skip'),
+  limit:  z.coerce.number().int().min(1).max(100).default(20).describe('Number of records to return'),
+});
+
+const responseSchema = z.object({
+  items: z.array(z.object({
+    // TODO: define item fields based on the DB table columns
+    id: z.uuid().describe('Unique identifier'),
+  })),
+  total: z.number().describe('Total number of records'),
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/<resource>',
+  summary: 'List <resource>s',
+  tags: ['<Resource>'],
+  request: { query: queryParamsSchema },
+  responses: {
+    200: { description: 'Success', content: { 'application/json': { schema: responseSchema } } },
+    500: { description: 'Internal server error' },
+  },
+});
+
+export const schema = APIGatewayProxyEventSchema.extend({
+  queryStringParameters: queryParamsSchema,
+});
+```
+
+### POST — request body
+
+```typescript
+import { APIGatewayProxyEventSchema } from '@aws-lambda-powertools/parser/schemas/api-gateway';
+import { JSONStringified } from '@aws-lambda-powertools/parser/helpers';
+import z from 'zod';
+import { registry } from '@/utils/openapi.util';
+
+const requestBodySchema = z.object({
+  // TODO: define body fields — map to the DB table's required columns
+});
+
+const responseSchema = z.object({
+  id: z.uuid().describe('ID of the created <resource>'),
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/<resource>',
+  summary: 'Create a <resource>',
+  tags: ['<Resource>'],
+  request: { body: { content: { 'application/json': { schema: requestBodySchema } } } },
+  responses: {
+    201: { description: 'Created', content: { 'application/json': { schema: responseSchema } } },
+    400: { description: 'Invalid request body' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+export const schema = APIGatewayProxyEventSchema.extend({
+  body: JSONStringified(requestBodySchema),
+});
+```
+
+### PUT — path param + request body
+
+```typescript
+import { APIGatewayProxyEventSchema } from '@aws-lambda-powertools/parser/schemas/api-gateway';
+import { JSONStringified } from '@aws-lambda-powertools/parser/helpers';
+import z from 'zod';
+import { registry } from '@/utils/openapi.util';
+
+const pathParamsSchema = z.object({
+  id: z.uuid().describe('ID of the <resource> to update'),
+});
+
+const requestBodySchema = z.object({
+  // TODO: define updatable fields
+});
+
+const responseSchema = z.object({
+  id: z.uuid().describe('Unique identifier'),
+  // TODO: include updated fields in response
+});
+
+registry.registerPath({
+  method: 'put',
+  path: '/<resource>/{id}',
+  summary: 'Update a <resource>',
+  tags: ['<Resource>'],
+  request: {
+    params: pathParamsSchema,
+    body: { content: { 'application/json': { schema: requestBodySchema } } },
+  },
+  responses: {
+    200: { description: 'Updated', content: { 'application/json': { schema: responseSchema } } },
+    400: { description: 'Invalid request body' },
+    404: { description: '<Resource> not found' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+export const schema = APIGatewayProxyEventSchema.extend({
+  pathParameters: pathParamsSchema,
+  body: JSONStringified(requestBodySchema),
+});
+```
+
+### DELETE — path param only
+
+```typescript
+import { APIGatewayProxyEventSchema } from '@aws-lambda-powertools/parser/schemas/api-gateway';
+import z from 'zod';
+import { registry } from '@/utils/openapi.util';
+
+const pathParamsSchema = z.object({
+  id: z.uuid().describe('ID of the <resource> to delete'),
+});
+
+registry.registerPath({
+  method: 'delete',
+  path: '/<resource>/{id}',
+  summary: 'Delete a <resource>',
+  tags: ['<Resource>'],
+  request: { params: pathParamsSchema },
+  responses: {
+    204: { description: 'Deleted' },
+    404: { description: '<Resource> not found' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+export const schema = APIGatewayProxyEventSchema.extend({
+  pathParameters: pathParamsSchema,
+});
+```
+
+Replace all `<resource>`, `<Resource>`, `<param>` placeholders with the actual values.
+Fill in `TODO` fields using the DB table columns found in Step 3 where possible.
+
+## Step 5 — Generate src/functions/<resource>/<action>/index.ts
+
+### With DB (Drizzle)
+
+```typescript
+import { injectLambdaContext } from '@aws-lambda-powertools/logger/middleware';
+import { parser } from '@aws-lambda-powertools/parser/middleware';
+import middy from '@middy/core';
+import httpErrorHandler from '@middy/http-error-handler';
+import createError from 'http-errors';
+import { eq } from 'drizzle-orm';
+
+import { db } from '@/db';
+import { <table> } from '@/db/schema';
+import { logger } from '@/utils/logger.util';
+import { serializer } from '@/utils/response.util';
+import { schema } from './schema';
+
+export const handler = middy()
+  .use(injectLambdaContext(logger, { logEvent: true, correlationIdPath: 'requestContext.requestId' }))
+  .use(httpErrorHandler())
+  .use(serializer())
+  .use(parser({ schema }))
+  .handler(async (event) => {
+    // TODO: implement business logic
+    return { statusCode: 200, body: {} };
+  });
+```
+
+Fill in the handler body based on the method:
+
+- **GET (single)**: query with `eq`, throw `createError.NotFound()` if result is undefined
+- **GET (list)**: query with `orderBy` + `limit` + `offset`, return `{ items, total: items.length }`
+- **POST**: `db.insert().values().returning()`, return `{ statusCode: 201, body: { id } }`
+- **PUT**: `db.update().set().where().returning()`, throw `createError.NotFound()` if returning is empty
+- **DELETE**: `db.delete().where().returning()`, throw `createError.NotFound()` if returning is empty, return `{ statusCode: 204 }`
+
+### Without DB
+
+Same middleware chain, omit `db` and `drizzle-orm` imports. Implement business logic with a `TODO` comment.
+
+## Step 6 — Register the route in scripts/generate-openapi.ts
+
+Add an import line for the new schema file after the last existing schema import, maintaining alphabetical order within the resource group:
+
+```typescript
+import '@/functions/<resource>/<action>/schema';
+```
+
+## Step 7 — Report completion
+
+```
+Created:
+  src/functions/<resource>/<action>/index.ts
+  src/functions/<resource>/<action>/schema.ts
+
+Registered in:
+  scripts/generate-openapi.ts
+
+Next steps:
+  • Fill in any TODO fields in index.ts and schema.ts
+  • Run `bun run openapi:generate` to update the OpenAPI spec
+  • Use the write-tests agent to generate tests for this handler
+```

@@ -1,0 +1,13 @@
+{
+  "name": "lambda-api-plugin",
+  "version": "0.2.0",
+  "description": "AWS API Gateway + Lambda Server API development toolkit with skills, agents, and commands covering handler development, Drizzle ORM, testing, CDK infrastructure, TypeScript, and code quality",
+  "author": {
+    "name": "HU",
+    "email": "hushukang@gmail.com"
+  },
+  "keywords": ["aws", "lambda", "api-gateway", "typescript", "serverless", "vitest", "biome"],
+  "repository": "https://github.com/hu-shukang/lambda-api-plugin",
+  "homepage": "https://github.com/hu-shukang/lambda-api-plugin#readme",
+  "license": "MIT"
+}
